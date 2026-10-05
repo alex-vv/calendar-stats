@@ -4,6 +4,7 @@ Script for fetching events from the macOS calendar for a given date.
 """
 
 import argparse
+import os
 import subprocess
 import re
 from datetime import datetime, timedelta
@@ -58,13 +59,10 @@ def parse_apple_date_to_datetime(date_str: str) -> datetime | None:
     return datetime(int(year), month, int(day), int(hour), int(minute), int(second))
 
 
-def calculate_duration_hours(start_str: str, end_str: str) -> float:
+def calculate_duration_hours(start_dt: datetime | None, end_dt: datetime | None) -> float:
     """
     Calculates the event duration in hours (rounded to two decimals).
     """
-    start_dt = parse_apple_date_to_datetime(start_str)
-    end_dt = parse_apple_date_to_datetime(end_str)
-
     if not start_dt or not end_dt:
         return 0.0
 
@@ -147,8 +145,8 @@ end tell
             if len(parts) >= 3:
                 event = {
                     'summary': parts[0] if parts[0] else 'Untitled',
-                    'startDate': parts[1] if len(parts) > 1 else '',
-                    'endDate': parts[2] if len(parts) > 2 else '',
+                    'start': parse_apple_date_to_datetime(parts[1] if len(parts) > 1 else ''),
+                    'end': parse_apple_date_to_datetime(parts[2] if len(parts) > 2 else ''),
                     'location': parts[3] if len(parts) > 3 and parts[3] != 'missing value' else None
                 }
                 events.append(event)
@@ -165,6 +163,115 @@ end tell
     except Exception as e:
         print(f"Error: {e}")
         return []
+
+
+def _ical_to_datetime(value):
+    """
+    Converts an icalendar DTSTART/DTEND value to a naive local datetime.
+    """
+    if value is None:
+        return None
+
+    dt = value.dt
+    if isinstance(dt, datetime):
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+
+    # All-day event: date has no time component
+    return datetime.combine(dt, datetime.min.time())
+
+
+def get_calendar_events_caldav(
+    username: str,
+    password: str,
+    calendar_names: list[str],
+    date_start: str,
+    date_end: str,
+    url: str = 'https://caldav.icloud.com/',
+) -> list[dict]:
+    """
+    Fetches events from calendars via CalDAV for the given period.
+
+    Args:
+        username: Apple ID (email)
+        password: App-specific password
+        calendar_names: Calendar display names
+        date_start: Start date in YYYY-MM-DD format
+        date_end: End date in YYYY-MM-DD format
+        url: CalDAV server URL
+
+    Returns:
+        List of dictionaries with event information
+    """
+    try:
+        import caldav
+    except ImportError:
+        print("Error: 'caldav' package is required for --method caldav. "
+              "Install it with: pip install -r requirements.txt")
+        return []
+
+    local_tz = datetime.now().astimezone().tzinfo
+    search_start = datetime.strptime(date_start, '%Y-%m-%d').replace(tzinfo=local_tz)
+    search_end = datetime.strptime(date_end, '%Y-%m-%d').replace(tzinfo=local_tz) + timedelta(days=1)
+
+    try:
+        client = caldav.DAVClient(url=url, username=username, password=password)
+        principal = client.principal()
+        calendars = principal.calendars()
+    except Exception as e:
+        print(f"Error: CalDAV connection failed: {e}")
+        return []
+
+    events = []
+    for calendar_name in calendar_names:
+        matching = [c for c in calendars if c.get_display_name() == calendar_name]
+        if not matching:
+            print(f"Warning: Calendar '{calendar_name}' not found via CalDAV")
+            continue
+
+        for calendar in matching:
+            try:
+                results = calendar.search(
+                    start=search_start,
+                    end=search_end,
+                    event=True,
+                    expand=True,
+                )
+            except Exception as e:
+                print(f"Error: Failed to fetch '{calendar_name}': {e}")
+                continue
+
+            for item in results:
+                comp = getattr(item, 'icalendar_component', None)
+                if comp is None:
+                    comp = item.vobject_instance.vevent
+
+                dtstart_value = comp.get('DTSTART')
+                dtend_value = comp.get('DTEND')
+                start_dt = _ical_to_datetime(dtstart_value)
+                end_dt = _ical_to_datetime(dtend_value)
+
+                # All-day event without DTEND spans a full day
+                if (end_dt is None and start_dt is not None
+                        and dtstart_value is not None
+                        and not isinstance(dtstart_value.dt, datetime)):
+                    end_dt = start_dt + timedelta(days=1)
+
+                # Fallback to DURATION when DTEND is missing
+                if end_dt is None and start_dt is not None and comp.get('DURATION') is not None:
+                    end_dt = start_dt + comp.get('DURATION').dt
+
+                summary = comp.get('SUMMARY')
+                location = comp.get('LOCATION')
+                events.append({
+                    'summary': str(summary) if summary else 'Untitled',
+                    'start': start_dt,
+                    'end': end_dt,
+                    'location': str(location) if location else None,
+                })
+
+    return events
 
 
 def main():
@@ -193,6 +300,27 @@ def main():
         '--prefix',
         default=None,
         help='Filter events by title prefix'
+    )
+    parser.add_argument(
+        '--method',
+        choices=['applescript', 'caldav'],
+        default='applescript',
+        help='How to fetch events (default: applescript)'
+    )
+    parser.add_argument(
+        '--username',
+        default=None,
+        help='Apple ID for CalDAV (or CALDAV_USERNAME env var)'
+    )
+    parser.add_argument(
+        '--password',
+        default=None,
+        help='App-specific password for CalDAV (or CALDAV_PASSWORD env var)'
+    )
+    parser.add_argument(
+        '--caldav-url',
+        default='https://caldav.icloud.com/',
+        help='CalDAV server URL (default: https://caldav.icloud.com/)'
     )
 
     args = parser.parse_args()
@@ -224,9 +352,20 @@ def main():
     print(f"Period: {date_start} — {date_end}")
     print()
 
-    events = []
-    for calendar in calendars:
-        events.extend(get_calendar_events(calendar, date_start, date_end))
+    if args.method == 'caldav':
+        username = args.username or os.environ.get('CALDAV_USERNAME')
+        password = args.password or os.environ.get('CALDAV_PASSWORD')
+        if not username or not password:
+            print("Error: CalDAV requires --username/--password "
+                  "or CALDAV_USERNAME/CALDAV_PASSWORD env vars")
+            return
+        events = get_calendar_events_caldav(
+            username, password, calendars, date_start, date_end, args.caldav_url
+        )
+    else:
+        events = []
+        for calendar in calendars:
+            events.extend(get_calendar_events(calendar, date_start, date_end))
 
     # Filter by prefix
     if args.prefix:
@@ -238,7 +377,7 @@ def main():
 
     grouped = {}
     for event in events:
-        start_dt = parse_apple_date_to_datetime(event.get('startDate', ''))
+        start_dt = event.get('start')
         day_key = start_dt.strftime('%Y-%m-%d') if start_dt else 'No date'
         grouped.setdefault(day_key, []).append(event)
 
@@ -247,7 +386,7 @@ def main():
         day_duration = 0.0
         for event in grouped[day_key]:
             day_duration += calculate_duration_hours(
-                event.get('startDate', ''), event.get('endDate', '')
+                event.get('start'), event.get('end')
             )
         total_duration += day_duration
         print(f"{day_key}: {day_duration:.2f} h")
