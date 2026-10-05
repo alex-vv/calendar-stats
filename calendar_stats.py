@@ -173,7 +173,7 @@ def main():
     )
     parser.add_argument(
         'calendar',
-        help='Calendar name'
+        help='Calendar name, or several names separated by "," (e.g. work,projects)'
     )
     parser.add_argument(
         'date_start',
@@ -218,11 +218,15 @@ def main():
             print(f"Error: Invalid {arg_name} date format. Use YYYY-MM-DD")
             return
 
-    print(f"Calendar: {args.calendar}")
+    calendars = [c.strip() for c in args.calendar.split(',') if c.strip()]
+
+    print(f"Calendar: {', '.join(calendars)}")
     print(f"Period: {date_start} — {date_end}")
     print()
 
-    events = get_calendar_events(args.calendar, date_start, date_end)
+    events = []
+    for calendar in calendars:
+        events.extend(get_calendar_events(calendar, date_start, date_end))
 
     # Filter by prefix
     if args.prefix:
