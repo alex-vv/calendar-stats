@@ -1,168 +1,38 @@
 #!/usr/bin/env python3
 """
-Script for fetching events from the macOS calendar for a given date.
+Script for fetching events from iCloud calendars via CalDAV for a given date.
 """
 
 import argparse
 import os
-import subprocess
 import re
 from datetime import datetime, timedelta
 
 
-def parse_apple_date(date_str: str) -> str:
+def split_event_hours(start_dt: datetime | None, end_dt: datetime | None) -> dict[str, float]:
     """
-    Converts a date from AppleScript format to dd.mm.yyyy hh:mm.
+    Splits an event duration across calendar days.
 
-    Example input format: "Friday, 20 March 2026 at 17:30:00"
+    Events crossing midnight are counted separately for each day.
+    Returns a mapping of 'YYYY-MM-DD' to hours spent on that day.
     """
-    if not date_str:
-        return ''
+    result: dict[str, float] = {}
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return result
 
-    # Extract date components using regex
-    match = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{2}):(\d{2}):(\d{2})', date_str)
-    if not match:
-        return date_str
+    day = start_dt.date()
+    last_day = end_dt.date()
+    while day <= last_day:
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+        overlap_start = max(start_dt, day_start)
+        overlap_end = min(end_dt, day_end)
+        hours = (overlap_end - overlap_start).total_seconds() / 3600
+        if hours > 0:
+            result[day.strftime('%Y-%m-%d')] = hours
+        day += timedelta(days=1)
 
-    day, month_name, year, hour, minute, _ = match.groups()
-
-    months = {
-        'January': '01', 'February': '02', 'March': '03', 'April': '04',
-        'May': '05', 'June': '06', 'July': '07', 'August': '08',
-        'September': '09', 'October': '10', 'November': '11', 'December': '12'
-    }
-
-    month = months.get(month_name, '01')
-    return f"{day.zfill(2)}.{month}.{year} {hour}:{minute}"
-
-
-def parse_apple_date_to_datetime(date_str: str) -> datetime | None:
-    """
-    Converts a date from AppleScript format to a datetime object.
-    """
-    if not date_str:
-        return None
-
-    match = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{2}):(\d{2}):(\d{2})', date_str)
-    if not match:
-        return None
-
-    day, month_name, year, hour, minute, second = match.groups()
-
-    months = {
-        'January': 1, 'February': 2, 'March': 3, 'April': 4,
-        'May': 5, 'June': 6, 'July': 7, 'August': 8,
-        'September': 9, 'October': 10, 'November': 11, 'December': 12
-    }
-
-    month = months.get(month_name, 1)
-    return datetime(int(year), month, int(day), int(hour), int(minute), int(second))
-
-
-def calculate_duration_hours(start_dt: datetime | None, end_dt: datetime | None) -> float:
-    """
-    Calculates the event duration in hours (rounded to two decimals).
-    """
-    if not start_dt or not end_dt:
-        return 0.0
-
-    duration = (end_dt - start_dt).total_seconds() / 3600
-    return round(duration, 2)
-
-
-def get_calendar_events(calendar_name: str, date_start: str, date_end: str) -> list[dict]:
-    """
-    Fetches events from the specified macOS calendar for the given period.
-
-    Args:
-        calendar_name: Calendar name
-        date_start: Start date in YYYY-MM-DD format
-        date_end: End date in YYYY-MM-DD format
-
-    Returns:
-        List of dictionaries with event information
-    """
-    # Convert YYYY-MM-DD to a format AppleScript understands: "20 March 2026"
-    months = {
-        1: 'January', 2: 'February', 3: 'March', 4: 'April',
-        5: 'May', 6: 'June', 7: 'July', 8: 'August',
-        9: 'September', 10: 'October', 11: 'November', 12: 'December'
-    }
-
-    dt_start = datetime.strptime(date_start, '%Y-%m-%d')
-    dt_end = datetime.strptime(date_end, '%Y-%m-%d')
-
-    apple_start = f"{dt_start.day} {months[dt_start.month]} {dt_start.year}"
-    apple_end = f"{dt_end.day} {months[dt_end.month]} {dt_end.year}"
-
-    apple_script = f'''
-tell application "Calendar"
-    set calendarList to name of every calendar
-    
-    if "{calendar_name}" is not in calendarList then
-        error "Calendar '{calendar_name}' not found"
-    end if
-    
-    set targetCalendar to calendar "{calendar_name}"
-
-    set startDate to date "{apple_start}"
-    set startDate to startDate - (time of startDate)
-    set endDate to date "{apple_end}"
-    set endDate to endDate - (time of endDate) + (1 * days)
-
-    set dayEvents to every event of targetCalendar whose start date >= startDate and start date < endDate
-
-    set outputText to ""
-    repeat with evt in dayEvents
-        set summaryText to summary of evt
-        set startDateText to start date of evt
-        set endDateText to end date of evt
-        set locationText to location of evt
-        if outputText is not "" then
-            set outputText to outputText & linefeed
-        end if
-        set outputText to outputText & (summaryText & "|" & startDateText & "|" & endDateText & "|" & locationText)
-    end repeat
-    return outputText
-end tell
-'''
-
-    try:
-        result = subprocess.run(
-            ['osascript', '-e', apple_script],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-
-        output = result.stdout.strip()
-        if not output:
-            return []
-
-        events = []
-        for line in output.split('\n'):
-            parts = line.split('|')
-            if len(parts) >= 3:
-                event = {
-                    'summary': parts[0] if parts[0] else 'Untitled',
-                    'start': parse_apple_date_to_datetime(parts[1] if len(parts) > 1 else ''),
-                    'end': parse_apple_date_to_datetime(parts[2] if len(parts) > 2 else ''),
-                    'location': parts[3] if len(parts) > 3 and parts[3] != 'missing value' else None
-                }
-                events.append(event)
-
-        return events
-
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.strip()
-        if "not found" in error_msg:
-            print(f"Error: Calendar '{calendar_name}' not found")
-        else:
-            print(f"Error: {error_msg}")
-        return []
-    except Exception as e:
-        print(f"Error: {e}")
-        return []
+    return result
 
 
 def _ical_to_datetime(value):
@@ -182,7 +52,29 @@ def _ical_to_datetime(value):
     return datetime.combine(dt, datetime.min.time())
 
 
-def get_calendar_events_caldav(
+def _travel_delta(comp):
+    """
+    Extracts the Apple travel time (X-APPLE-TRAVEL-DURATION) as a timedelta.
+    """
+    value = comp.get('X-APPLE-TRAVEL-DURATION')
+    if value is None:
+        return None
+
+    dt = getattr(value, 'dt', value)
+    if isinstance(dt, timedelta):
+        return dt
+
+    if isinstance(dt, str):
+        try:
+            from icalendar.prop import vDuration
+            return vDuration.from_ical(dt)
+        except Exception:
+            return None
+
+    return None
+
+
+def get_calendar_events(
     username: str,
     password: str,
     calendar_names: list[str],
@@ -207,7 +99,7 @@ def get_calendar_events_caldav(
     try:
         import caldav
     except ImportError:
-        print("Error: 'caldav' package is required for --method caldav. "
+        print("Error: 'caldav' package is required. "
               "Install it with: pip install -r requirements.txt")
         return []
 
@@ -262,6 +154,11 @@ def get_calendar_events_caldav(
                 if end_dt is None and start_dt is not None and comp.get('DURATION') is not None:
                     end_dt = start_dt + comp.get('DURATION').dt
 
+                # Travel time counts as time before the event
+                travel = _travel_delta(comp)
+                if travel and start_dt is not None:
+                    start_dt = start_dt - travel
+
                 summary = comp.get('SUMMARY')
                 location = comp.get('LOCATION')
                 events.append({
@@ -276,7 +173,7 @@ def get_calendar_events_caldav(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Fetch events from the macOS calendar for a given period'
+        description='Fetch events from iCloud calendars via CalDAV for a given period'
     )
     parser.add_argument(
         'calendar',
@@ -300,12 +197,6 @@ def main():
         '--prefix',
         default=None,
         help='Filter events by title prefix'
-    )
-    parser.add_argument(
-        '--method',
-        choices=['applescript', 'caldav'],
-        default='applescript',
-        help='How to fetch events (default: applescript)'
     )
     parser.add_argument(
         '--username',
@@ -352,20 +243,16 @@ def main():
     print(f"Period: {date_start} — {date_end}")
     print()
 
-    if args.method == 'caldav':
-        username = args.username or os.environ.get('CALDAV_USERNAME')
-        password = args.password or os.environ.get('CALDAV_PASSWORD')
-        if not username or not password:
-            print("Error: CalDAV requires --username/--password "
-                  "or CALDAV_USERNAME/CALDAV_PASSWORD env vars")
-            return
-        events = get_calendar_events_caldav(
-            username, password, calendars, date_start, date_end, args.caldav_url
-        )
-    else:
-        events = []
-        for calendar in calendars:
-            events.extend(get_calendar_events(calendar, date_start, date_end))
+    username = args.username or os.environ.get('CALDAV_USERNAME')
+    password = args.password or os.environ.get('CALDAV_PASSWORD')
+    if not username or not password:
+        print("Error: CalDAV requires --username/--password "
+              "or CALDAV_USERNAME/CALDAV_PASSWORD env vars")
+        return
+
+    events = get_calendar_events(
+        username, password, calendars, date_start, date_end, args.caldav_url
+    )
 
     # Filter by prefix
     if args.prefix:
@@ -375,19 +262,19 @@ def main():
         print("No events found")
         return
 
-    grouped = {}
+    day_totals = {}
     for event in events:
         start_dt = event.get('start')
-        day_key = start_dt.strftime('%Y-%m-%d') if start_dt else 'No date'
-        grouped.setdefault(day_key, []).append(event)
+        if not start_dt:
+            day_totals.setdefault('No date', 0.0)
+            continue
+        day_totals.setdefault(start_dt.strftime('%Y-%m-%d'), 0.0)
+        for day_key, hours in split_event_hours(start_dt, event.get('end')).items():
+            day_totals[day_key] = day_totals.get(day_key, 0.0) + hours
 
     total_duration = 0.0
-    for day_key in sorted(grouped.keys()):
-        day_duration = 0.0
-        for event in grouped[day_key]:
-            day_duration += calculate_duration_hours(
-                event.get('start'), event.get('end')
-            )
+    for day_key in sorted(day_totals.keys()):
+        day_duration = round(day_totals[day_key], 2)
         total_duration += day_duration
         print(f"{day_key}: {day_duration:.2f} h")
 
